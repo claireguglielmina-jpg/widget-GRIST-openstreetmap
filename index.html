@@ -74,7 +74,7 @@
   const CACHE_TTL_MS = 90 * 24 * 3600 * 1000; // durée de validité du cache : 90 jours
   const FETCH_TIMEOUT_MS = 12000;     // timeout d’une requête pour un établissement
   const PREFETCH_TIMEOUT_MS = 40000;  // timeout d’une requête de préchargement (plusieurs établissements)
-  const PREFETCH_CHUNK = 10;          // établissements interrogés par requête lors du préchargement
+  const PREFETCH_CHUNK = 6;           // établissements interrogés par requête lors du préchargement
   const HEDGE_DELAY_MS = 2500;        // délai avant d’interroger le serveur suivant s’il n’y a pas de réponse
 
   const OVERPASS_ENDPOINTS = [
@@ -307,6 +307,7 @@
   const cache = new Map();
   const cacheRowIds = new Map();     // clé -> id de ligne dans la table Grist
   let gristCacheOk = false;          // true si la table Grist est utilisable
+  let cacheError = '';               // dernier message d’erreur d’accès à la table Grist
   let cacheReady = Promise.resolve();
 
   const cacheKey = (lat, lng) => lat.toFixed(5) + ',' + lng.toFixed(5) + ',' + RADIUS_M;
@@ -332,6 +333,7 @@
       }
       gristCacheOk = true;
     } catch (e) {
+      cacheError = (e && e.message) ? e.message : String(e);
       console.warn('Cache Grist indisponible (accès « full » requis) :', e);
     }
     updatePrefetchUI();
@@ -362,7 +364,10 @@
       const ids = res && res.retValues && res.retValues[actions.length - 1];
       if (newKeys.length && Array.isArray(ids)) newKeys.forEach((k, i) => cacheRowIds.set(k, ids[i]));
     } catch (e) {
+      cacheError = (e && e.message) ? e.message : String(e);
+      gristCacheOk = false;
       console.warn('Écriture du cache Grist impossible :', e);
+      updatePrefetchUI();
     }
   }
 
@@ -465,8 +470,14 @@
       return await Promise.any(jobs.map((j) => j.promise));
     } catch (e) {
       if (signal && signal.aborted) throw abortError();
-      const errs = e && e.errors;
-      throw (errs && errs[0]) || new Error('Overpass indisponible');
+      // Échec réseau / timeout / HTTP : on le renvoie sous un nom qui n'est PAS « AbortError »,
+      // sinon il serait pris pour une annulation volontaire.
+      const errs = (e && e.errors) || [];
+      const real = errs.find((x) => x && x.name !== 'AbortError') || errs[0];
+      const msg = real ? (real.name === 'AbortError' ? 'délai dépassé' : real.message) : 'Overpass indisponible';
+      const err = new Error(msg);
+      err.name = 'OverpassError';
+      throw err;
     } finally {
       jobs.forEach((j) => j.abort());
     }
@@ -527,7 +538,8 @@
     pfBtn.disabled = !total || cached === total;
     pfStatus.textContent = pfMessage ||
       (total ? cached + ' / ' + total + ' établissements en cache' : '') +
-      (gristCacheOk || !total ? '' : ' (mémoire seulement)');
+      (gristCacheOk || !total ? '' : ' — NON enregistré dans Grist (mémoire seulement)' +
+        (cacheError ? ' : ' + cacheError : ''));
   }
 
   async function prefetchAll() {
@@ -543,27 +555,43 @@
     let done = 0, failed = 0;
     pfStatus.textContent = '0 / ' + todo.length + ' …';
 
+    let lastErr = '';
+
+    // Interroge un groupe ; en cas d'échec, le coupe en deux et réessaie (jusqu'à l'établissement seul)
+    async function doChunk(chunk) {
+      try {
+        const elements = await queryOverpass(
+          chunk.map((s) => [s.lat, s.lng]), prefetchAbort.signal, PREFETCH_TIMEOUT_MS);
+        const items = parseElements(elements);
+        await persist(chunk.map((s) => [
+          cacheKey(s.lat, s.lng),
+          items.filter((it) => distanceM(s.lat, s.lng, it[1], it[2]) <= RADIUS_M)
+        ]));
+        done += chunk.length;
+      } catch (e) {
+        if (prefetchAbort.signal.aborted) throw abortError();
+        if (chunk.length > 1) {
+          const mid = Math.ceil(chunk.length / 2);
+          await doChunk(chunk.slice(0, mid));
+          await doChunk(chunk.slice(mid));
+          return;
+        }
+        failed++; done++;
+        lastErr = (e && e.message) || 'erreur';
+      }
+      pfStatus.textContent = done + ' / ' + todo.length + ' …';
+    }
+
     try {
       for (let i = 0; i < todo.length; i += PREFETCH_CHUNK) {
-        const chunk = todo.slice(i, i + PREFETCH_CHUNK);
-        try {
-          const elements = await queryOverpass(
-            chunk.map((s) => [s.lat, s.lng]), prefetchAbort.signal, PREFETCH_TIMEOUT_MS);
-          const items = parseElements(elements);
-          await persist(chunk.map((s) => [
-            cacheKey(s.lat, s.lng),
-            items.filter((it) => distanceM(s.lat, s.lng, it[1], it[2]) <= RADIUS_M)
-          ]));
-        } catch (e) {
-          if (e && e.name === 'AbortError') throw e;
-          failed += chunk.length;
-        }
-        done += chunk.length;
-        pfStatus.textContent = done + ' / ' + todo.length + ' …';
+        await doChunk(todo.slice(i, i + PREFETCH_CHUNK));
+        await new Promise((r) => setTimeout(r, 400)); // ménage les serveurs Overpass publics
       }
-      pfMessage = failed ? (failed + ' établissement(s) non chargés, relancez pour réessayer') : '';
+      pfMessage = failed
+        ? (failed + ' établissement(s) non chargés (' + lastErr + '), relancez pour réessayer')
+        : '';
     } catch (e) {
-      pfMessage = 'Préchargement interrompu';
+      pfMessage = prefetchAbort.signal.aborted ? 'Préchargement arrêté' : ('Erreur : ' + ((e && e.message) || e));
     } finally {
       prefetching = false;
       updatePrefetchUI();
