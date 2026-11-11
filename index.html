@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -42,6 +43,13 @@
   .tp-gare { border: 2px solid #b3261e; }
   .tp-bus  { border: 2px solid #0b5cad; }
 
+  .prefetch { max-width: 230px; }
+  .pf-btn { font: inherit; font-size: 12.5px; padding: 5px 9px; border: 1px solid #bbb; border-radius: 5px; background: #fff; cursor: pointer; color: #222; width: 100%; }
+  .pf-btn:hover:not(:disabled) { background: #f4f4f4; }
+  .pf-btn:disabled { color: #888; cursor: default; }
+  .pf-status { margin-top: 4px; color: #555; }
+  .pf-status:empty { display: none; }
+
   .leaflet-popup-content { font-size: 13px; }
   .leaflet-popup-content .sub { color: #555; }
   .reset-btn { font-size: 16px; line-height: 30px; text-align: center; text-decoration: none; cursor: pointer; width: 30px; height: 30px; display: block; color: #222; background: #fff; }
@@ -61,6 +69,13 @@
    *  Configuration
    * ------------------------------------------------------------------ */
   const RADIUS_M = 1000; // rayon de zoom et de recherche des transports (en mètres)
+
+  const CACHE_TABLE = 'Cache_Transports'; // table Grist créée automatiquement
+  const CACHE_TTL_MS = 90 * 24 * 3600 * 1000; // durée de validité du cache : 90 jours
+  const FETCH_TIMEOUT_MS = 12000;     // timeout d’une requête pour un établissement
+  const PREFETCH_TIMEOUT_MS = 40000;  // timeout d’une requête de préchargement (plusieurs établissements)
+  const PREFETCH_CHUNK = 10;          // établissements interrogés par requête lors du préchargement
+  const HEDGE_DELAY_MS = 2500;        // délai avant d’interroger le serveur suivant s’il n’y a pas de réponse
 
   const OVERPASS_ENDPOINTS = [
     'https://overpass-api.de/api/interpreter',
@@ -164,7 +179,7 @@
         (counts ? '<span class="n">' + n + '</span>' : '') + '</div>';
     }
     html += '<hr>' +
-      '<div class="row"><span class="ico">🚆</span><span>Gare</span></div>' +
+      '<div class="row"><span class="ico">🚂</span><span>Gare</span></div>' +
       '<div class="row"><span class="ico">🚌</span><span>Arrêt de bus ou de tram</span></div>';
     legendEl.innerHTML = html;
   }
@@ -195,12 +210,14 @@
    *  Établissements
    * ------------------------------------------------------------------ */
   let schoolPoints = [];   // [lat, lng] pour la vue d’ensemble
+  let schoolsUnique = [];  // établissements distincts (pour le préchargement)
   let current = null;      // établissement sélectionné
   let hasFitAll = false;
 
   function renderSchools(rows) {
     schoolsLayer.clearLayers();
     schoolPoints = [];
+    schoolsUnique = [];
     const seen = new Set();
     const counts = { college: 0, general: 0, pro: 0, poly: 0, autre: 0 };
 
@@ -212,6 +229,7 @@
       const cat = classify(r.type);
       counts[cat]++;
       schoolPoints.push([r.lat, r.lng]);
+      schoolsUnique.push({ lat: r.lat, lng: r.lng });
 
       const m = L.circleMarker([r.lat, r.lng], {
         radius: 7,
@@ -232,6 +250,7 @@
     }
 
     renderLegend(counts);
+    updatePrefetchUI();
 
     if (!hasFitAll && !current && schoolPoints.length) {
       map.fitBounds(L.latLngBounds(schoolPoints), { padding: [30, 30] });
@@ -279,30 +298,99 @@
   }
 
   /* ------------------------------------------------------------------ *
-   *  Transports via Overpass (OpenStreetMap)
+   *  Transports via Overpass (OpenStreetMap) + cache persistant dans Grist
    * ------------------------------------------------------------------ */
   let reqId = 0, abortCtrl = null, timer = null;
+
+  // Cache : clé « lat,lng,rayon » -> liste compacte [code, lat, lon, nom]
+  // code : 'g' = gare, 't' = arrêt de tram, 'b' = arrêt de bus
   const cache = new Map();
+  const cacheRowIds = new Map();     // clé -> id de ligne dans la table Grist
+  let gristCacheOk = false;          // true si la table Grist est utilisable
+  let cacheReady = Promise.resolve();
+
+  const cacheKey = (lat, lng) => lat.toFixed(5) + ',' + lng.toFixed(5) + ',' + RADIUS_M;
+
+  async function initCache() {
+    try {
+      const tables = await grist.docApi.listTables();
+      if (!tables.includes(CACHE_TABLE)) {
+        await grist.docApi.applyUserActions([['AddTable', CACHE_TABLE, [
+          { id: 'Cle',     type: 'Text' },
+          { id: 'Donnees', type: 'Text' },
+          { id: 'Maj',     type: 'Numeric' }
+        ]]]);
+      }
+      const t = await grist.docApi.fetchTable(CACHE_TABLE);
+      const now = Date.now();
+      for (let i = 0; i < t.id.length; i++) {
+        const key = t.Cle[i];
+        if (!key) continue;
+        cacheRowIds.set(key, t.id[i]);
+        if (now - (Number(t.Maj[i]) || 0) > CACHE_TTL_MS) continue; // périmé : sera réécrit
+        try { cache.set(key, JSON.parse(t.Donnees[i])); } catch (e) { /* ligne ignorée */ }
+      }
+      gristCacheOk = true;
+    } catch (e) {
+      console.warn('Cache Grist indisponible (accès « full » requis) :', e);
+    }
+    updatePrefetchUI();
+  }
+
+  /** Mémorise [[clé, items], …] en mémoire puis dans la table Grist (en une seule requête). */
+  async function persist(entries) {
+    for (const [k, items] of entries) cache.set(k, items);
+    updatePrefetchUI();
+    if (!gristCacheOk) return;
+
+    const now = Date.now();
+    const actions = [], newKeys = [], newData = [];
+    for (const [k, items] of entries) {
+      const data = JSON.stringify(items);
+      const rowId = cacheRowIds.get(k);
+      if (rowId) actions.push(['UpdateRecord', CACHE_TABLE, rowId, { Donnees: data, Maj: now }]);
+      else { newKeys.push(k); newData.push(data); }
+    }
+    if (newKeys.length) {
+      actions.push(['BulkAddRecord', CACHE_TABLE, newKeys.map(() => null), {
+        Cle: newKeys, Donnees: newData, Maj: newKeys.map(() => now)
+      }]);
+    }
+    if (!actions.length) return;
+    try {
+      const res = await grist.docApi.applyUserActions(actions);
+      const ids = res && res.retValues && res.retValues[actions.length - 1];
+      if (newKeys.length && Array.isArray(ids)) newKeys.forEach((k, i) => cacheRowIds.set(k, ids[i]));
+    } catch (e) {
+      console.warn('Écriture du cache Grist impossible :', e);
+    }
+  }
 
   function scheduleTransport(s) {
     clearTimeout(timer);
-    timer = setTimeout(() => loadTransport(s), 300); // évite les requêtes en rafale quand on parcourt les lignes
+    // Immédiat si déjà en cache ; sinon petit délai pour éviter les requêtes en rafale
+    const delay = cache.has(cacheKey(s.lat, s.lng)) ? 0 : 300;
+    timer = setTimeout(() => loadTransport(s), delay);
   }
 
   async function loadTransport(s) {
     const id = ++reqId;
     if (abortCtrl) abortCtrl.abort();
-    const key = s.lat.toFixed(5) + ',' + s.lng.toFixed(5);
+    const key = cacheKey(s.lat, s.lng);
 
     try {
-      let elements = cache.get(key);
-      if (!elements) {
+      await cacheReady;
+      if (id !== reqId) return;
+      let items = cache.get(key);
+      const fromCache = !!items;
+      if (!items) {
         abortCtrl = new AbortController();
-        elements = await queryOverpass(s.lat, s.lng, abortCtrl.signal);
-        cache.set(key, elements);
+        const elements = await queryOverpass([[s.lat, s.lng]], abortCtrl.signal, FETCH_TIMEOUT_MS);
+        items = parseElements(elements);
+        persist([[key, items]]); // sans attendre : l’affichage passe en premier
       }
       if (id !== reqId) return;
-      drawTransport(elements, s);
+      drawTransport(items, s, fromCache);
     } catch (e) {
       if (id !== reqId || (e && e.name === 'AbortError')) return;
       const cat = classify(s.type);
@@ -314,48 +402,78 @@
     }
   }
 
-  async function queryOverpass(lat, lng, signal) {
-    const around = '(around:' + RADIUS_M + ',' + lat + ',' + lng + ')';
-    const q = '[out:json][timeout:25];(' +
-      'nwr["railway"~"^(station|halt)$"]' + around + ';' +
-      'node["railway"="tram_stop"]' + around + ';' +
-      'node["highway"="bus_stop"]' + around + ';' +
-      ');out center tags;';
-
-    let lastErr = new Error('Overpass indisponible');
-    for (const url of OVERPASS_ENDPOINTS) {
-      try {
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'data=' + encodeURIComponent(q),
-          signal: signal
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const json = await res.json();
-        return json.elements || [];
-      } catch (e) {
-        if (e && e.name === 'AbortError') throw e;
-        lastErr = e;
-      }
+  function buildQuery(points) {
+    let body = '';
+    for (const p of points) {
+      const a = '(around:' + RADIUS_M + ',' + p[0] + ',' + p[1] + ')';
+      body += 'nw["railway"~"^(station|halt)$"]' + a + ';' +
+              'node["railway"="tram_stop"]' + a + ';' +
+              'node["highway"="bus_stop"]' + a + ';';
     }
-    throw lastErr;
+    return '[out:json][timeout:25];(' + body + ');out center tags qt;';
   }
 
-  function transportIcon(kind) {
-    return L.divIcon({
-      className: '',
-      html: '<div class="tp tp-' + kind + '">' + (kind === 'gare' ? '🚆' : '🚌') + '</div>',
-      iconSize: [26, 26],
-      iconAnchor: [13, 13],
-      popupAnchor: [0, -13],
-      tooltipAnchor: [0, -13]
+  function abortError() {
+    const err = new Error('Aborted');
+    err.name = 'AbortError';
+    return err;
+  }
+
+  /** Une requête vers un serveur, démarrée après `delay` ms, avec timeout propre. */
+  function fetchOne(url, q, signal, delay, timeoutMs) {
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    let to = null;
+    const promise = (async () => {
+      if (delay) await new Promise((r) => setTimeout(r, delay));
+      if (ctrl.signal.aborted) throw abortError();
+      to = setTimeout(() => ctrl.abort(), timeoutMs);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'data=' + encodeURIComponent(q),
+        signal: ctrl.signal
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const json = await res.json();
+      // Overpass répond parfois 200 avec une remarque d’erreur et aucun résultat
+      if (json.remark && !(json.elements && json.elements.length) && /error|timed out|out of memory/i.test(json.remark)) {
+        throw new Error(json.remark);
+      }
+      return json.elements || [];
+    })().finally(() => {
+      clearTimeout(to);
+      if (signal) signal.removeEventListener('abort', onAbort);
     });
+    return { promise: promise, abort: () => ctrl.abort() };
   }
 
-  function drawTransport(elements, s) {
-    transportLayer.clearLayers();
+  /**
+   * Interroge les serveurs Overpass « en course » : le premier part tout de suite,
+   * les suivants démarrent seulement s’il n’a pas répondu au bout de quelques secondes.
+   * Le premier qui répond gagne, les autres sont annulés.
+   */
+  async function queryOverpass(points, signal, timeoutMs) {
+    const q = buildQuery(points);
+    const jobs = OVERPASS_ENDPOINTS.map((url, i) =>
+      fetchOne(url, q, signal, i * HEDGE_DELAY_MS, timeoutMs));
+    try {
+      return await Promise.any(jobs.map((j) => j.promise));
+    } catch (e) {
+      if (signal && signal.aborted) throw abortError();
+      const errs = e && e.errors;
+      throw (errs && errs[0]) || new Error('Overpass indisponible');
+    } finally {
+      jobs.forEach((j) => j.abort());
+    }
+  }
 
+  /** Convertit la réponse Overpass en liste compacte [code, lat, lon, nom], sans doublons de gares. */
+  function parseElements(elements) {
     const items = [];
     for (const el of elements) {
       const t = el.tags || {};
@@ -363,24 +481,118 @@
       const lon = el.lon != null ? el.lon : (el.center && el.center.lon);
       if (lat == null || lon == null) continue;
 
-      let kind, label;
-      if (t.railway === 'station' || t.railway === 'halt') { kind = 'gare'; label = 'Gare'; }
-      else if (t.railway === 'tram_stop') { kind = 'bus'; label = 'Arrêt de tram'; }
-      else if (t.highway === 'bus_stop') { kind = 'bus'; label = 'Arrêt de bus'; }
+      let code;
+      if (t.railway === 'station' || t.railway === 'halt') code = 'g';
+      else if (t.railway === 'tram_stop') code = 't';
+      else if (t.highway === 'bus_stop') code = 'b';
       else continue;
 
-      items.push({ kind: kind, label: label, lat: lat, lon: lon, name: t.name || t['name:fr'] || '' });
+      items.push({ code: code, lat: lat, lon: lon, name: t.name || t['name:fr'] || '' });
     }
 
     // Une gare peut être cartographiée à la fois en point et en bâtiment : on évite les doublons
     const gares = [];
     const kept = items.filter((it) => {
-      if (it.kind !== 'gare' || !it.name) return true;
+      if (it.code !== 'g' || !it.name) return true;
       const dup = gares.some((g) => g.name.toLowerCase() === it.name.toLowerCase() &&
         distanceM(g.lat, g.lon, it.lat, it.lon) < 250);
       if (!dup) gares.push(it);
       return !dup;
     });
+    return kept.map((it) => [it.code, +it.lat.toFixed(6), +it.lon.toFixed(6), it.name]);
+  }
+
+  /* ---- Préchargement de tous les établissements (bouton en bas à droite) ---- */
+  const prefetchEl = L.DomUtil.create('div', 'panel prefetch');
+  prefetchEl.innerHTML = '<button type="button" class="pf-btn">⚡ Précharger les transports</button>' +
+    '<div class="pf-status hint"></div>';
+  const PrefetchControl = L.Control.extend({
+    options: { position: 'bottomright' },
+    onAdd: function () {
+      L.DomEvent.disableClickPropagation(prefetchEl);
+      return prefetchEl;
+    }
+  });
+  map.addControl(new PrefetchControl());
+  const pfBtn = prefetchEl.querySelector('.pf-btn');
+  const pfStatus = prefetchEl.querySelector('.pf-status');
+
+  let prefetching = false, prefetchAbort = null, pfMessage = '';
+
+  function updatePrefetchUI() {
+    if (prefetching) return;
+    const total = schoolsUnique.length;
+    const cached = schoolsUnique.filter((s) => cache.has(cacheKey(s.lat, s.lng))).length;
+    pfBtn.textContent = '⚡ Précharger les transports';
+    pfBtn.disabled = !total || cached === total;
+    pfStatus.textContent = pfMessage ||
+      (total ? cached + ' / ' + total + ' établissements en cache' : '') +
+      (gristCacheOk || !total ? '' : ' (mémoire seulement)');
+  }
+
+  async function prefetchAll() {
+    if (prefetching) { prefetchAbort.abort(); return; }
+    await cacheReady;
+    const todo = schoolsUnique.filter((s) => !cache.has(cacheKey(s.lat, s.lng)));
+    if (!todo.length) { updatePrefetchUI(); return; }
+
+    prefetching = true;
+    prefetchAbort = new AbortController();
+    pfMessage = '';
+    pfBtn.textContent = '■ Arrêter';
+    let done = 0, failed = 0;
+    pfStatus.textContent = '0 / ' + todo.length + ' …';
+
+    try {
+      for (let i = 0; i < todo.length; i += PREFETCH_CHUNK) {
+        const chunk = todo.slice(i, i + PREFETCH_CHUNK);
+        try {
+          const elements = await queryOverpass(
+            chunk.map((s) => [s.lat, s.lng]), prefetchAbort.signal, PREFETCH_TIMEOUT_MS);
+          const items = parseElements(elements);
+          await persist(chunk.map((s) => [
+            cacheKey(s.lat, s.lng),
+            items.filter((it) => distanceM(s.lat, s.lng, it[1], it[2]) <= RADIUS_M)
+          ]));
+        } catch (e) {
+          if (e && e.name === 'AbortError') throw e;
+          failed += chunk.length;
+        }
+        done += chunk.length;
+        pfStatus.textContent = done + ' / ' + todo.length + ' …';
+      }
+      pfMessage = failed ? (failed + ' établissement(s) non chargés, relancez pour réessayer') : '';
+    } catch (e) {
+      pfMessage = 'Préchargement interrompu';
+    } finally {
+      prefetching = false;
+      updatePrefetchUI();
+      pfMessage = '';
+    }
+  }
+  pfBtn.addEventListener('click', prefetchAll);
+
+
+  function transportIcon(kind) {
+    return L.divIcon({
+      className: '',
+      html: '<div class="tp tp-' + kind + '">' + (kind === 'gare' ? '🚂' : '🚌') + '</div>',
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+      popupAnchor: [0, -13],
+      tooltipAnchor: [0, -13]
+    });
+  }
+
+  function drawTransport(items, s, fromCache) {
+    transportLayer.clearLayers();
+
+    const kept = items.map((a) => ({
+      kind: a[0] === 'g' ? 'gare' : 'bus',
+      label: a[0] === 'g' ? 'Gare' : (a[0] === 't' ? 'Arrêt de tram' : 'Arrêt de bus'),
+      lat: a[1], lon: a[2], name: a[3]
+    }));
+
 
     let nGares = 0, nArrets = 0;
     for (const it of kept) {
@@ -404,8 +616,8 @@
     setInfo(
       '<div class="nom">' + esc(s.nom || 'Sans nom') + '</div>' +
       '<div class="hint">' + esc(CATS[cat].label) + '</div>' +
-      '<div>🚆 ' + plural(nGares, 'gare', 'gares') + ' · 🚌 ' + plural(nArrets, 'arrêt', 'arrêts') +
-      ' <span class="hint">dans ' + (RADIUS_M / 1000) + '&nbsp;km</span></div>'
+      '<div>🚂 ' + plural(nGares, 'gare', 'gares') + ' · 🚌 ' + plural(nArrets, 'arrêt', 'arrêts') +
+      ' <span class="hint">dans ' + (RADIUS_M / 1000) + '&nbsp;km' + (fromCache ? ' · ⚡ en cache' : '') + '</span></div>'
     );
   }
 
@@ -426,9 +638,10 @@
   }
 
   setInfoIdle();
+  cacheReady = initCache();
 
   grist.ready({
-    requiredAccess: 'read table',
+    requiredAccess: 'full', // nécessaire pour lire/écrire la table de cache
     columns: [
       { name: 'type', title: 'Type d’établissement (colonne G)', type: 'Text,Choice' },
       { name: 'nom',  title: 'Nom', type: 'Text,Choice', optional: true },
